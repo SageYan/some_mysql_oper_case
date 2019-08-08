@@ -1,0 +1,981 @@
+[TOC]
+
+# Metadata lock致使主从延迟解决案例
+
+
+
+## 问题现象
+
+主从同步延迟变大
+
+## 问题解决详细
+
+### 信息搜集与分析
+
+> 客户架构为主从同步，从机连接统计应用
+
+#### 1. 主从同步的信息
+
+```sql
+mysql> show slave status\G;
+*************************** 1. row ***************************
+               Slave_IO_State: System lock
+                  Master_Host: 119.90.40.222
+                  Master_User: repluser
+                  Master_Port: 3306
+                Connect_Retry: 60
+              Master_Log_File: master-bin.006431
+          Read_Master_Log_Pos: 447018712
+               Relay_Log_File: hjkj-mysql-relay-bin.011962
+                Relay_Log_Pos: 55121584
+        Relay_Master_Log_File: master-bin.006383
+             Slave_IO_Running: Yes
+            Slave_SQL_Running: Yes
+              Replicate_Do_DB: 
+          Replicate_Ignore_DB: 
+           Replicate_Do_Table: 
+       Replicate_Ignore_Table: 
+      Replicate_Wild_Do_Table: fireway.%,finance.%
+  Replicate_Wild_Ignore_Table: 
+                   Last_Errno: 0
+                   Last_Error: 
+                 Skip_Counter: 0
+          Exec_Master_Log_Pos: 592012742
+              Relay_Log_Space: 52706919609
+              Until_Condition: None
+               Until_Log_File: 
+                Until_Log_Pos: 0
+           Master_SSL_Allowed: No
+           Master_SSL_CA_File: 
+           Master_SSL_CA_Path: 
+              Master_SSL_Cert: 
+            Master_SSL_Cipher: 
+               Master_SSL_Key: 
+        Seconds_Behind_Master: 102848
+Master_SSL_Verify_Server_Cert: No
+                Last_IO_Errno: 0
+                Last_IO_Error: 
+               Last_SQL_Errno: 0
+               Last_SQL_Error: 
+  Replicate_Ignore_Server_Ids: 
+             Master_Server_Id: 100
+                  Master_UUID: 5cc28f3c-6a8d-11e4-beff-00163e5563d9
+             Master_Info_File: mysql.slave_master_info
+                    SQL_Delay: 0
+          SQL_Remaining_Delay: NULL
+      Slave_SQL_Running_State: Waiting for Slave Worker to release partition
+           Master_Retry_Count: 86400
+                  Master_Bind: 
+      Last_IO_Error_Timestamp: 
+     Last_SQL_Error_Timestamp: 
+               Master_SSL_Crl: 
+           Master_SSL_Crlpath: 
+           Retrieved_Gtid_Set: 5cc28f3c-6a8d-11e4-beff-00163e5563d9:491028361-559217939
+            Executed_Gtid_Set: 5cc28f3c-6a8d-11e4-beff-00163e5563d9:1-556109607,
+d58717f7-6c22-11e7-9954-00163e00013d:1-1208994
+                Auto_Position: 1
+
+```
+
+- 同步没有断开，但是延迟还一直在增加，卡在重演alter表 lm_repayment_plan操作上了
+
+#### 2. 当前正在执行的事务与连接信息
+
+```sql
+information_schema:
+mysql> select timediff(sysdate(),trx_started) timediff,sysdate(),trx_started,id,USER,DB,COMMAND,STATE,trx_state from processlist,innodb_trx where trx_mysql_thread_id=id;
++----------+---------------------+---------------------+-------+-------------+---------+---------+---------------------------------+-----------+
+| timediff | sysdate()           | trx_started         | id    | USER        | DB      | COMMAND | STATE                           | trx_state |
++----------+---------------------+---------------------+-------+-------------+---------+---------+---------------------------------+-----------+
+| 00:00:00 | 2017-08-18 11:23:14 | 2017-08-18 11:23:14 | 46426 | myexx       | edw     | Execute | update                          | RUNNING   |
+| 00:25:40 | 2017-08-18 11:23:14 | 2017-08-18 10:57:34 | 46425 | myexx       | edw     | Sleep   |                                 | RUNNING   |
+| 26:51:39 | 2017-08-18 11:23:14 | 2017-08-17 08:31:35 |     6 | system user | fireway | Connect | Waiting for table metadata lock | RUNNING   |
+| 25:28:44 | 2017-08-18 11:23:14 | 2017-08-17 09:54:30 | 42187 | myexx       | fireway | Query   | Sending data                    | RUNNING   |
++----------+---------------------+---------------------+-------+-------------+---------+---------+---------------------------------+-----------+
+```
+
+- 一条query的执行时间为`2017-08-17 09:54:30`，状态为发送数据状态；
+- 一条DDL的执行时间为26:51:39，状态为等待元数据锁；
+- 首先ddl在与谁争抢lm_repayment_plan表的metadata锁？并不是id为42187的session，因为该session比alter后创建，那么是谁呢？
+- 先kill掉id为42187的session，看看情况如何
+
+### 故障排查
+
+1. 先kill掉id为42187的session
+2. 可以看到统计应用发送了很多新的查询请求
+3. 但是不一会儿，连接中出现了很多等待metadata的连接
+4. 原先的alter请求还是在等待metadata lock
+5. 再一次说明系统中有事务对lm_repayment_plan表成功申请了metadata锁
+6. 而在processlist中看不到成功申请了metadata锁的对表lm_repayment_plan的查询，在innodb_trx表中也看不到相关事务
+7. 猜测，Alter语句`Waiting for table metadata lock`的原因是由系统执行alter之前有错误查询事务未提交或回滚导致的
+8. 继续验证，通过查询`performance_schema.events_statements_current`表，查看是否存在对表lm_repayment_plan的错误查询
+9. 验证成功，确实属于`ddl等待metadata lock的三种场景`中的第三种——*错误查询事务未提交或回滚导致的*
+
+```
+mysql> kill 42187;
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> select * from information_schema.processlist where id=42187;
+Empty set (0.00 sec)
+
+mysql> select timediff(sysdate(),trx_started) timediff,sysdate(),trx_started,id,USER,DB,COMMAND,STATE,trx_state from processlist,innodb_trx where trx_mysql_thread_id=id;
++----------+---------------------+---------------------+-------+-------+---------+---------+----------------+-----------+
+| timediff | sysdate()           | trx_started         | id    | USER  | DB      | COMMAND | STATE          | trx_state |
++----------+---------------------+---------------------+-------+-------+---------+---------+----------------+-----------+
+| 00:00:02 | 2017-08-18 11:34:47 | 2017-08-18 11:34:45 | 46324 | myexx | edw     | Execute | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 46323 | myexx | edw     | Sleep   |                | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 46322 | myexx | fireway | Query   | Writing to net | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 46341 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 45530 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 46591 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:42 | 2017-08-18 11:34:47 | 2017-08-18 11:34:05 | 46222 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 46239 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 46106 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 46051 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:42 | 2017-08-18 11:34:47 | 2017-08-18 11:34:05 | 46033 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 45902 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 45056 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 44955 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 44901 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 44856 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 44842 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:42 | 2017-08-18 11:34:47 | 2017-08-18 11:34:05 | 44840 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:42 | 2017-08-18 11:34:47 | 2017-08-18 11:34:05 | 44823 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 44189 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 44186 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 44085 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 44051 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 44013 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 44012 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 43778 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:42 | 2017-08-18 11:34:47 | 2017-08-18 11:34:05 | 43782 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 43755 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 43720 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 43430 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 43366 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 43290 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 43278 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 43269 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 42183 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 41712 | myexx | fireway | Query   | Sending data   | RUNNING   |
+| 00:00:43 | 2017-08-18 11:34:47 | 2017-08-18 11:34:04 | 41332 | myexx | fireway | Query   | Sending data   | RUNNING   |
++----------+---------------------+---------------------+-------+-------+---------+---------+----------------+-----------+
+37 rows in set, 8 warnings (0.00 sec)
+
+mysql> select id,State,command from information_schema.processlist where State="Waiting for table metadata lock";
++-------+---------------------------------+---------+
+| id    | State                           | command |
++-------+---------------------------------+---------+
+| 46033 | Waiting for table metadata lock | Query   |
+| 46712 | Waiting for table metadata lock | Query   |
+| 45902 | Waiting for table metadata lock | Query   |
+| 47014 | Waiting for table metadata lock | Query   |
+| 46899 | Waiting for table metadata lock | Query   |
+| 46341 | Waiting for table metadata lock | Query   |
+| 45056 | Waiting for table metadata lock | Query   |
+| 46931 | Waiting for table metadata lock | Query   |
+| 46239 | Waiting for table metadata lock | Query   |
+|     6 | Waiting for table metadata lock | Connect |
++-------+---------------------------------+---------+
+10 rows in set (0.00 sec)
+
+mysql> select * from performance_schema.events_statements_current where SQL_TEXT like '%lm_repayment_plan%'\G;
+*************************** 1. row ***************************
+              THREAD_ID: 25
+               EVENT_ID: 10549251
+           END_EVENT_ID: NULL
+             EVENT_NAME: statement/sql/alter_table
+                 SOURCE: log_event.cc:4821
+            TIMER_START: 585050476881132000
+              TIMER_END: 589075028965108000
+             TIMER_WAIT: 4024552083976000
+              LOCK_TIME: 0
+               SQL_TEXT: ALTER TABLE lm_repayment_plan ADD plan_disacount_fee_HJ DECIMAL(10,2) COMMENT '计划惠今贴息费用' 
+                 DIGEST: NULL
+            DIGEST_TEXT: NULL
+         CURRENT_SCHEMA: fireway
+            OBJECT_TYPE: NULL
+          OBJECT_SCHEMA: NULL
+            OBJECT_NAME: NULL
+  OBJECT_INSTANCE_BEGIN: NULL
+            MYSQL_ERRNO: 0
+      RETURNED_SQLSTATE: NULL
+           MESSAGE_TEXT: NULL
+                 ERRORS: 0
+               WARNINGS: 0
+          ROWS_AFFECTED: 0
+              ROWS_SENT: 0
+          ROWS_EXAMINED: 0
+CREATED_TMP_DISK_TABLES: 0
+     CREATED_TMP_TABLES: 0
+       SELECT_FULL_JOIN: 0
+ SELECT_FULL_RANGE_JOIN: 0
+           SELECT_RANGE: 0
+     SELECT_RANGE_CHECK: 0
+            SELECT_SCAN: 0
+      SORT_MERGE_PASSES: 0
+             SORT_RANGE: 0
+              SORT_ROWS: 0
+              SORT_SCAN: 0
+          NO_INDEX_USED: 0
+     NO_GOOD_INDEX_USED: 0
+       NESTING_EVENT_ID: NULL
+     NESTING_EVENT_TYPE: NULL
+*************************** 2. row ***************************
+              THREAD_ID: 46052
+               EVENT_ID: 24
+           END_EVENT_ID: NULL
+             EVENT_NAME: statement/sql/select
+                 SOURCE: mysqld.cc:966
+            TIMER_START: 585113134402214000
+              TIMER_END: 589075029012876000
+             TIMER_WAIT: 3961894610662000
+              LOCK_TIME: 0
+               SQL_TEXT: SELECT  t3.name AS 融资人姓名1,t3.identification_number AS 身份证号1,CONCAT(SUBSTR(t3.name,1,1),CASE WHEN CHAR_LENGTH(t3.name) > 2 THEN '**' ELSE '*' END ) AS 融资人姓名2,CONCAT(SUBSTR(t3.identification_number,1,4),'**********',SUBSTR(t3.identification_number,15,4)) AS 身份证号2,
+t2.tenor AS '融资总笔数/期限',
+t1.tenor AS  本期融资期限（月）,
+ROUND((t1.plan_principal+t1.plan_service_fee)/(1+0.068/12*t1.tenor),2) AS 本期融资额度（元）
+FROM fireway.lm_repayment_plan t1,fireway.lm_account t2,fireway.lm_customer t3,fireway.lm_contract t4,(SELECT * FROM fireway.lm_contract_mgmt_log WHERE operate_type='2' GROUP BY application_number) t5
+WHERE t1.account_id=t2.id     AND t1.tenor=2 AND t4.fund_source=103  
+AND t2.customer_id=t3.id AND t2.contract_id=t4.id
+AND t4.id=t5.contract_id AND t2.status NOT IN('5')
+AND DATE_FORMAT(t5.operate_time,'%Y-%m-%d')>=DATE_SUB(CURDATE(),INTERVAL 60 DAY)
+AND ((DATE_FORMAT(t5.operate_time,'%Y-%m-%d') BETWEEN '2017-08-16' AND '2017-08-16' 
+ A...
+                 DIGEST: NULL
+            DIGEST_TEXT: NULL
+         CURRENT_SCHEMA: fireway
+            OBJECT_TYPE: NULL
+          OBJECT_SCHEMA: NULL
+            OBJECT_NAME: NULL
+  OBJECT_INSTANCE_BEGIN: NULL
+            MYSQL_ERRNO: 0
+      RETURNED_SQLSTATE: NULL
+           MESSAGE_TEXT: NULL
+                 ERRORS: 0
+               WARNINGS: 0
+          ROWS_AFFECTED: 0
+              ROWS_SENT: 0
+          ROWS_EXAMINED: 0
+CREATED_TMP_DISK_TABLES: 0
+     CREATED_TMP_TABLES: 0
+       SELECT_FULL_JOIN: 0
+ SELECT_FULL_RANGE_JOIN: 0
+           SELECT_RANGE: 0
+     SELECT_RANGE_CHECK: 0
+            SELECT_SCAN: 0
+      SORT_MERGE_PASSES: 0
+             SORT_RANGE: 0
+              SORT_ROWS: 0
+              SORT_SCAN: 0
+          NO_INDEX_USED: 0
+     NO_GOOD_INDEX_USED: 0
+       NESTING_EVENT_ID: NULL
+     NESTING_EVENT_TYPE: NULL
+*************************** 3. row ***************************
+              THREAD_ID: 46888
+               EVENT_ID: 15
+           END_EVENT_ID: NULL
+             EVENT_NAME: statement/sql/select
+                 SOURCE: mysqld.cc:966
+            TIMER_START: 589075028786589000
+              TIMER_END: 589075029290252000
+             TIMER_WAIT: 503663000
+              LOCK_TIME: 96000000
+               SQL_TEXT: select * from performance_schema.events_statements_current where SQL_TEXT like '%lm_repayment_plan%'
+                 DIGEST: NULL
+            DIGEST_TEXT: NULL
+         CURRENT_SCHEMA: information_schema
+            OBJECT_TYPE: NULL
+          OBJECT_SCHEMA: NULL
+            OBJECT_NAME: NULL
+  OBJECT_INSTANCE_BEGIN: NULL
+            MYSQL_ERRNO: 0
+      RETURNED_SQLSTATE: NULL
+           MESSAGE_TEXT: NULL
+                 ERRORS: 0
+               WARNINGS: 0
+          ROWS_AFFECTED: 0
+              ROWS_SENT: 2
+          ROWS_EXAMINED: 0
+CREATED_TMP_DISK_TABLES: 0
+     CREATED_TMP_TABLES: 0
+       SELECT_FULL_JOIN: 0
+ SELECT_FULL_RANGE_JOIN: 0
+           SELECT_RANGE: 0
+     SELECT_RANGE_CHECK: 0
+            SELECT_SCAN: 1
+      SORT_MERGE_PASSES: 0
+             SORT_RANGE: 0
+              SORT_ROWS: 0
+              SORT_SCAN: 0
+          NO_INDEX_USED: 1
+     NO_GOOD_INDEX_USED: 0
+       NESTING_EVENT_ID: NULL
+     NESTING_EVENT_TYPE: NULL
+3 rows in set (0.00 sec)
+
+ERROR: 
+No query specified
+```
+
+### 初步结果
+
+```sql
+1. slave上于2017-08-17 08:31:35开始重演的的alter操作`ALTER TABLE lm_repayment_plan ADD total_disacount_fee_HJ DECIMAL (10,2) COMMENT '总惠今贴息费用汇总'”状态为“waiting for metadata lock`，等待元数据锁。
+2. Alter进入metadata锁等待的原因是由于**统计应用程序在对“lm_repayment_plan”表进行了一个失败的操作**“具体sql见第3条”，这时事务没有开始，但是**失败语句获取到的锁依然有效**。
+3. 错误语句获取到的锁在这个事务提交或回滚之前，仍然不会释放掉。
+4. **如何解决？**建议方案：
+   - 释放metadata锁，在不重启数据库服务器的前提下需要杀掉失败语句的会话线程`THREAD_ID: 46052`；
+   - 暂停slave，kill 当前等待metadata锁的线程，重启启动slave
+```
+
+
+
+ 
+
+### 解决步骤1
+
+> 1）释放metadata锁，在不重启数据库服务器的前提下需要杀掉失败语句的会话线程`THREAD_ID: 46052`；
+>
+> 2）暂停slave，kill 当前等待metadata锁的线程，启动slave
+
+1. 客户同意建议方案
+2. 通过`performance_schema.threads` 表获取`THREAD_ID: 46052`对应的`processlist_id:46033`
+3. 执行stop slave后会卡在那里，然后重新开启一个中断执行kill操作即可
+4. slave停掉后，统计业务发起的所有查询都没有问题了
+5. 但是一旦slave开启，执行alter又会重演刚才的争抢metadata锁的情况。
+6. **解决方法**：建议客户先暂停一下slave上的统计业务，待alter操作结束后再开启统计业务
+
+```sql
+mysql> select * from threads where thread_id=46052\G;
+*************************** 1. row ***************************
+          THREAD_ID: 46052
+               NAME: thread/sql/one_connection
+               TYPE: FOREGROUND
+     PROCESSLIST_ID: 46033
+   PROCESSLIST_USER: myexx
+   PROCESSLIST_HOST: 172.31.217.162
+     PROCESSLIST_DB: fireway
+PROCESSLIST_COMMAND: Query
+   PROCESSLIST_TIME: 8491
+  PROCESSLIST_STATE: Waiting for table metadata lock
+   PROCESSLIST_INFO: SELECT  t3.name AS 融资人姓名1,t3.identification_number AS 身份证号1,CONCAT(SUBSTR(t3.name,1,1),CASE WHEN CHAR_LENGTH(t3.name) > 2 THEN '**' ELSE '*' END ) AS 融资人姓名2,CONCAT(SUBSTR(t3.identification_number,1,4),'**********',SUBSTR(t3.identification_number,15,4)) AS 身份证号2,
+t2.tenor AS '融资总笔数/期限',
+t1.tenor AS  本期融资期限（月）,
+ROUND((t1.plan_principal+t1.plan_service_fee)/(1+0.068/12*t1.tenor),2) AS 本期融资额度（元）
+FROM fireway.lm_repayment_plan t1,fireway.lm_account t2,fireway.lm_customer t3,fireway.lm_contract t4,(SELECT * FROM fireway.lm_contract_mgmt_log WHERE operate_type='2' GROUP BY application_number) t5
+WHERE t1.account_id=t2.id     AND t1.tenor=2 AND t4.fund_source=103  
+AND t2.customer_id=t3.id AND t2.contract_id=t4.id
+AND t4.id=t5.contract_id AND t2.status NOT IN('5')
+AND DATE_FORMAT(t5.operate_time,'%Y-%m-%d')>=DATE_SUB(CURDATE(),INTERVAL 60 DAY)
+AND ((DATE_FORMAT(t5.operate_time,'%Y-%m-%d') BETWEEN '2017-08-16' AND '2017-08-16' 
+ AND 
+   PARENT_THREAD_ID: NULL
+               ROLE: NULL
+       INSTRUMENTED: YES
+1 row in set, 4 warnings (0.00 sec)
+
+ERROR: 
+No query specified
+
+mysql> select * from information_schema.processlist where id=46033\G;
+*************************** 1. row ***************************
+     ID: 46033
+   USER: myexx
+   HOST: 172.31.217.162:43291
+     DB: fireway
+COMMAND: Query
+   TIME: 8582
+  STATE: Waiting for table metadata lock
+   INFO: SELECT  t3.name AS 融资人姓名1,t3.identification_number AS 身份证号1,CONCAT(SUBSTR(t3.name,1,1),CASE WHEN CHAR_LENGTH(t3.name) > 2 THEN '**' ELSE '*' END ) AS 融资人姓名2,CONCAT(SUBSTR(t3.identification_number,1,4),'**********',SUBSTR(t3.identification_number,15,4)) AS 身份证号2,
+t2.tenor AS '融资总笔数/期限',
+t1.tenor AS  本期融资期限（月）,
+ROUND((t1.plan_principal+t1.plan_service_fee)/(1+0.068/12*t1.tenor),2) AS 本期融资额度（元）
+FROM fireway.lm_repayment_plan t1,fireway.lm_account t2,fireway.lm_customer t3,fireway.lm_contract t4,(SELECT * FROM fireway.lm_contract_mgmt_log WHERE operate_type='2' GROUP BY application_number) t5
+WHERE t1.account_id=t2.id     AND t1.tenor=2 AND t4.fund_source=103  
+AND t2.customer_id=t3.id AND t2.contract_id=t4.id
+AND t4.id=t5.contract_id AND t2.status NOT IN('5')
+AND DATE_FORMAT(t5.operate_time,'%Y-%m-%d')>=DATE_SUB(CURDATE(),INTERVAL 60 DAY)
+AND ((DATE_FORMAT(t5.operate_time,'%Y-%m-%d') BETWEEN '2017-08-16' AND '2017-08-16' 
+ AND t4.tenor in ('6','9','10','11','12','15','18') )
+
+
+
+
+)
+
+mysql> kill 46033
+
+mysql> select * from performance_schema.events_statements_current where SQL_TEXT like '%lm_repayment_plan%'\G;
+*************************** 1. row ***************************
+              THREAD_ID: 25
+               EVENT_ID: 10549251
+           END_EVENT_ID: NULL
+             EVENT_NAME: statement/sql/alter_table
+                 SOURCE: log_event.cc:4821
+            TIMER_START: 585050476881132000
+              TIMER_END: 593857183681374000
+             TIMER_WAIT: 8806706800242000
+              LOCK_TIME: 0
+               SQL_TEXT: ALTER TABLE lm_repayment_plan ADD plan_disacount_fee_HJ DECIMAL(10,2) COMMENT '计划惠今贴息费用'
+                 DIGEST: NULL
+            DIGEST_TEXT: NULL
+         CURRENT_SCHEMA: fireway
+            OBJECT_TYPE: NULL
+          OBJECT_SCHEMA: NULL
+            OBJECT_NAME: NULL
+  OBJECT_INSTANCE_BEGIN: NULL
+            MYSQL_ERRNO: 0
+      RETURNED_SQLSTATE: NULL
+           MESSAGE_TEXT: NULL
+                 ERRORS: 0
+               WARNINGS: 0
+          ROWS_AFFECTED: 0
+              ROWS_SENT: 0
+          ROWS_EXAMINED: 0
+CREATED_TMP_DISK_TABLES: 0
+     CREATED_TMP_TABLES: 0
+       SELECT_FULL_JOIN: 0
+ SELECT_FULL_RANGE_JOIN: 0
+           SELECT_RANGE: 0
+     SELECT_RANGE_CHECK: 0
+            SELECT_SCAN: 0
+      SORT_MERGE_PASSES: 0
+             SORT_RANGE: 0
+              SORT_ROWS: 0
+              SORT_SCAN: 0
+          NO_INDEX_USED: 0
+     NO_GOOD_INDEX_USED: 0
+       NESTING_EVENT_ID: NULL
+     NESTING_EVENT_TYPE: NULL
+*************************** 2. row ***************************
+              THREAD_ID: 46888
+               EVENT_ID: 88
+           END_EVENT_ID: NULL
+             EVENT_NAME: statement/sql/select
+                 SOURCE: mysqld.cc:966
+            TIMER_START: 593857183471207000
+              TIMER_END: 593857184028344000
+             TIMER_WAIT: 557137000
+              LOCK_TIME: 115000000
+               SQL_TEXT: select * from performance_schema.events_statements_current where SQL_TEXT like '%lm_repayment_plan%'
+                 DIGEST: NULL
+            DIGEST_TEXT: NULL
+         CURRENT_SCHEMA: performance_schema
+            OBJECT_TYPE: NULL
+          OBJECT_SCHEMA: NULL
+            OBJECT_NAME: NULL
+  OBJECT_INSTANCE_BEGIN: NULL
+            MYSQL_ERRNO: 0
+      RETURNED_SQLSTATE: NULL
+           MESSAGE_TEXT: NULL
+                 ERRORS: 0
+               WARNINGS: 0
+          ROWS_AFFECTED: 0
+              ROWS_SENT: 1
+          ROWS_EXAMINED: 0
+CREATED_TMP_DISK_TABLES: 0
+     CREATED_TMP_TABLES: 0
+       SELECT_FULL_JOIN: 0
+ SELECT_FULL_RANGE_JOIN: 0
+           SELECT_RANGE: 0
+     SELECT_RANGE_CHECK: 0
+            SELECT_SCAN: 1
+      SORT_MERGE_PASSES: 0
+             SORT_RANGE: 0
+              SORT_ROWS: 0
+              SORT_SCAN: 0
+          NO_INDEX_USED: 1
+     NO_GOOD_INDEX_USED: 0
+       NESTING_EVENT_ID: NULL
+     NESTING_EVENT_TYPE: NULL
+2 rows in set (0.00 sec)
+
+ERROR: 
+No query specified
+
+
+mysql> select id,State,command from information_schema.processlist where State="Waiting for table metadata lock";
++-------+---------------------------------+---------+
+| id    | State                           | command |
++-------+---------------------------------+---------+
+| 46712 | Waiting for table metadata lock | Query   |
+| 45902 | Waiting for table metadata lock | Query   |
+| 47014 | Waiting for table metadata lock | Query   |
+| 46899 | Waiting for table metadata lock | Query   |
+| 46341 | Waiting for table metadata lock | Query   |
+| 45056 | Waiting for table metadata lock | Query   |
+| 46931 | Waiting for table metadata lock | Query   |
+| 46239 | Waiting for table metadata lock | Query   |
+|     6 | Waiting for table metadata lock | Connect |
++-------+---------------------------------+---------+
+9 rows in set (0.00 sec)
+
+# 执行stop slave后会卡在那里，然后重新开启一个中断执行kill操作即可
+mysql> stop slave;
+Query OK, 0 rows affected (4 min 17.47 sec)
+
+mysql> kill 6;
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> select id,State,command from information_schema.processlist where State="Waiting for table metadata lock";
+Empty set (0.00 sec)
+
+mysql> select * from performance_schema.events_statements_current where SQL_TEXT like '%lm_repayment_plan%'\G;
+*************************** 1. row ***************************
+              THREAD_ID: 46888
+               EVENT_ID: 103
+           END_EVENT_ID: NULL
+             EVENT_NAME: statement/sql/select
+                 SOURCE: mysqld.cc:966
+            TIMER_START: 594817852560123000
+              TIMER_END: 594817852998067000
+             TIMER_WAIT: 437944000
+              LOCK_TIME: 144000000
+               SQL_TEXT: select * from performance_schema.events_statements_current where SQL_TEXT like '%lm_repayment_plan%'
+                 DIGEST: NULL
+            DIGEST_TEXT: NULL
+         CURRENT_SCHEMA: performance_schema
+            OBJECT_TYPE: NULL
+          OBJECT_SCHEMA: NULL
+            OBJECT_NAME: NULL
+  OBJECT_INSTANCE_BEGIN: NULL
+            MYSQL_ERRNO: 0
+      RETURNED_SQLSTATE: NULL
+           MESSAGE_TEXT: NULL
+                 ERRORS: 0
+               WARNINGS: 0
+          ROWS_AFFECTED: 0
+              ROWS_SENT: 0
+          ROWS_EXAMINED: 0
+CREATED_TMP_DISK_TABLES: 0
+     CREATED_TMP_TABLES: 0
+       SELECT_FULL_JOIN: 0
+ SELECT_FULL_RANGE_JOIN: 0
+           SELECT_RANGE: 0
+     SELECT_RANGE_CHECK: 0
+            SELECT_SCAN: 1
+      SORT_MERGE_PASSES: 0
+             SORT_RANGE: 0
+              SORT_ROWS: 0
+              SORT_SCAN: 0
+          NO_INDEX_USED: 1
+     NO_GOOD_INDEX_USED: 0
+       NESTING_EVENT_ID: NULL
+     NESTING_EVENT_TYPE: NULL
+1 row in set (0.00 sec)
+
+ERROR: 
+No query specified
+
+mysql> select id,State,command from information_schema.processlist where State="Waiting for table metadata lock";
+Empty set (0.00 sec)
+
+mysql> start slave;
+Query OK, 0 rows affected, 1 warning (0.03 sec)
+
+mysql> show slave status\G;
+*************************** 1. row ***************************
+               Slave_IO_State: Waiting for master to send event
+                  Master_Host: 119.90.40.222
+                  Master_User: repluser
+                  Master_Port: 3306
+                Connect_Retry: 60
+              Master_Log_File: master-bin.006433
+          Read_Master_Log_Pos: 1008510272
+               Relay_Log_File: hjkj-mysql-relay-bin.011962
+                Relay_Log_Pos: 58892116
+        Relay_Master_Log_File: master-bin.006383
+             Slave_IO_Running: Yes
+            Slave_SQL_Running: Yes
+              Replicate_Do_DB: 
+          Replicate_Ignore_DB: 
+           Replicate_Do_Table: 
+       Replicate_Ignore_Table: 
+      Replicate_Wild_Do_Table: fireway.%,finance.%
+  Replicate_Wild_Ignore_Table: 
+                   Last_Errno: 0
+                   Last_Error: 
+                 Skip_Counter: 0
+          Exec_Master_Log_Pos: 595783274
+              Relay_Log_Space: 55416084427
+              Until_Condition: None
+               Until_Log_File: 
+                Until_Log_Pos: 0
+           Master_SSL_Allowed: No
+           Master_SSL_CA_File: 
+           Master_SSL_CA_Path: 
+              Master_SSL_Cert: 
+            Master_SSL_Cipher: 
+               Master_SSL_Key: 
+        Seconds_Behind_Master: 113510
+Master_SSL_Verify_Server_Cert: No
+                Last_IO_Errno: 0
+                Last_IO_Error: 
+               Last_SQL_Errno: 0
+               Last_SQL_Error: 
+  Replicate_Ignore_Server_Ids: 
+             Master_Server_Id: 100
+                  Master_UUID: 5cc28f3c-6a8d-11e4-beff-00163e5563d9
+             Master_Info_File: mysql.slave_master_info
+                    SQL_Delay: 0
+          SQL_Remaining_Delay: NULL
+      Slave_SQL_Running_State: Waiting for Slave Worker to release partition
+           Master_Retry_Count: 86400
+                  Master_Bind: 
+      Last_IO_Error_Timestamp: 
+     Last_SQL_Error_Timestamp: 
+               Master_SSL_Crl: 
+           Master_SSL_Crlpath: 
+           Retrieved_Gtid_Set: 5cc28f3c-6a8d-11e4-beff-00163e5563d9:491028361-559461905
+            Executed_Gtid_Set: 5cc28f3c-6a8d-11e4-beff-00163e5563d9:1-556113714,
+d58717f7-6c22-11e7-9954-00163e00013d:1-1251047
+                Auto_Position: 1
+1 row in set (0.00 sec)
+
+ERROR: 
+No query specified
+
+mysql> select id,State,command from information_schema.processlist where State="Waiting for table metadata lock";
++-------+---------------------------------+---------+
+| id    | State                           | command |
++-------+---------------------------------+---------+
+| 47397 | Waiting for table metadata lock | Connect |
++-------+---------------------------------+---------+
+1 row in set (0.00 sec)
+
+mysql> stop slave;
+Query OK, 0 rows affected (2.75 sec)
+```
+
+### 解决步骤2
+
+1. 与客户沟通后，客户同意将报表业务临时切换使用珠海的slave
+2. 启动slave待alter操作完成
+3. 大概于17:00完成alter
+4. slave开始追主库，延迟时间在缩小
+
+```sql 
+# 客户停止业务后
+# 杀掉业务线程
+mysql> select id,user,host,db from information_schema.processlist where user='myexx' and db='fireway';
++-------+-------+----------------------+---------+
+| id    | user  | host                 | db      |
++-------+-------+----------------------+---------+
+| 45902 | myexx | 172.31.217.162:43144 | fireway |
+| 47014 | myexx | 113.204.212.74:44154 | fireway |
+| 46106 | myexx | 172.31.217.162:43356 | fireway |
+| 47083 | myexx | 113.204.212.74:33589 | fireway |
+| 46051 | myexx | 172.31.217.162:43298 | fireway |
+| 45056 | myexx | 172.31.217.162:41922 | fireway |
+| 45070 | myexx | 172.31.217.162:41943 | fireway |
+| 46931 | myexx | 113.204.212.74:26413 | fireway |
+| 46239 | myexx | 172.31.217.162:43452 | fireway |
++-------+-------+----------------------+---------+
+9 rows in set (0.00 sec)
+
+mysql> kill 45902;
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> kill 47014;
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> kill 46106;
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> kill 47083;
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> kill 46051;
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> kill 45056;
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> kill 45070;
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> kill 46931;
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> kill 46239;
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> select id,user,host,db from information_schema.processlist where user='myexx' and db='fireway';
+Empty set (0.00 sec)
+
+mysql> show processlist;
++-------+-----------------+----------------------+--------------------+---------+--------+------------------------+------------------+
+| Id    | User            | Host                 | db                 | Command | Time   | State                  | Info             |
++-------+-----------------+----------------------+--------------------+---------+--------+------------------------+------------------+
+|     7 | event_scheduler | localhost            | NULL               | Daemon  | 598582 | Waiting on empty queue | NULL             |
+| 46771 | root            | localhost            | NULL               | Sleep   |   2764 |                        | NULL             |
+| 46869 | root            | localhost            | performance_schema | Query   |      0 | init                   | show processlist |
+| 47051 | myexx           | 119.146.223.2:36979  | edw                | Sleep   |   5750 |                        | NULL             |
+| 47226 | myexx           | 113.204.212.74:33401 | edw                | Sleep   |   4129 |                        | NULL             |
+| 47259 | root            | localhost            | information_schema | Sleep   |   2882 |                        | NULL             |
+| 47402 | myexx           | 119.146.223.2:42171  | fr_user            | Sleep   |    314 |                        | NULL             |
+| 47403 | myexx           | 119.146.223.2:48401  | fr_user            | Sleep   |     14 |                        | NULL             |
+| 47606 | myexx           | 119.146.223.2:53035  | fr_user            | Sleep   |     38 |                        | NULL             |
+| 47607 | myexx           | 119.146.223.2:44448  | fr_user            | Sleep   |     38 |                        | NULL             |
++-------+-----------------+----------------------+--------------------+---------+--------+------------------------+------------------+
+10 rows in set (0.00 sec)
+
+mysql> start slave;
+Query OK, 0 rows affected, 1 warning (0.01 sec)
+
+mysql> show processlist;
++-------+-----------------+----------------------+--------------------+---------+--------+-----------------------------------------------+------------------------------------------------------------------------------------------------------+
+| Id    | User            | Host                 | db                 | Command | Time   | State                                         | Info                                                                                                 |
++-------+-----------------+----------------------+--------------------+---------+--------+-----------------------------------------------+------------------------------------------------------------------------------------------------------+
+|     7 | event_scheduler | localhost            | NULL               | Daemon  | 598606 | Waiting on empty queue                        | NULL                                                                                                 |
+| 46771 | root            | localhost            | NULL               | Sleep   |   2788 |                                               | NULL                                                                                                 |
+| 46869 | root            | localhost            | performance_schema | Query   |      0 | init                                          | show processlist                                                                                     |
+| 47051 | myexx           | 119.146.223.2:36979  | edw                | Sleep   |   5774 |                                               | NULL                                                                                                 |
+| 47226 | myexx           | 113.204.212.74:33401 | edw                | Sleep   |   4153 |                                               | NULL                                                                                                 |
+| 47259 | root            | localhost            | information_schema | Sleep   |   2906 |                                               | NULL                                                                                                 |
+| 47402 | myexx           | 119.146.223.2:42171  | fr_user            | Sleep   |    338 |                                               | NULL                                                                                                 |
+| 47403 | myexx           | 119.146.223.2:48401  | fr_user            | Sleep   |     14 |                                               | NULL                                                                                                 |
+| 47606 | myexx           | 119.146.223.2:53035  | fr_user            | Sleep   |      2 |                                               | NULL                                                                                                 |
+| 47607 | myexx           | 119.146.223.2:44448  | fr_user            | Sleep   |      2 |                                               | NULL                                                                                                 |
+| 47608 | system user     |                      | NULL               | Connect |      6 | Waiting for master to send event              | NULL                                                                                                 |
+| 47609 | system user     |                      | NULL               | Connect |      6 | Waiting for Slave Worker to release partition | NULL                                                                                                 |
+| 47610 | system user     |                      | NULL               | Connect |      6 | Waiting for an event from Coordinator         | NULL                                                                                                 |
+| 47611 | system user     |                      | NULL               | Connect |      6 | Waiting for an event from Coordinator         | NULL                                                                                                 |
+| 47612 | system user     |                      | NULL               | Connect |      6 | Waiting for an event from Coordinator         | NULL                                                                                                 |
+| 47613 | system user     |                      | fireway            | Connect | 118296 | altering table                                | ALTER TABLE lm_repayment_plan ADD plan_disacount_fee_HJ DECIMAL(10,2) COMMENT '计划惠今贴息费'        |
++-------+-----------------+----------------------+--------------------+---------+--------+-----------------------------------------------+------------------------------------------------------------------------------------------------------+
+16 rows in set (0.00 sec)
+
+mysql> select sysdate();
++---------------------+
+| sysdate()           |
++---------------------+
+| 2017-08-18 15:21:35 |
++---------------------+
+1 row in set (0.00 sec)
+
+mysql> # 查看有metalock锁的线程
+mysql> select id,State,command from information_schema.processlist where State="Waiting for table metadata lock";
+
+
+mysql> select * from performance_schema.events_statements_current where SQL_TEXT like '%lm_repayment_plan%'\G;
+*************************** 1. row ***************************
+              THREAD_ID: 47632
+               EVENT_ID: 1
+           END_EVENT_ID: NULL
+             EVENT_NAME: statement/sql/alter_table
+                 SOURCE: log_event.cc:4821
+            TIMER_START: 598604576932677000
+              TIMER_END: 599232453825418000
+             TIMER_WAIT: 627876892741000
+              LOCK_TIME: 6196000000
+               SQL_TEXT: ALTER TABLE lm_repayment_plan ADD plan_disacount_fee_HJ DECIMAL(10,2) COMMENT '计划惠今贴息费用'
+                 DIGEST: NULL
+            DIGEST_TEXT: NULL
+         CURRENT_SCHEMA: fireway
+            OBJECT_TYPE: NULL
+          OBJECT_SCHEMA: NULL
+            OBJECT_NAME: NULL
+  OBJECT_INSTANCE_BEGIN: NULL
+            MYSQL_ERRNO: 0
+      RETURNED_SQLSTATE: NULL
+           MESSAGE_TEXT: NULL
+                 ERRORS: 0
+               WARNINGS: 0
+          ROWS_AFFECTED: 0
+              ROWS_SENT: 0
+          ROWS_EXAMINED: 0
+CREATED_TMP_DISK_TABLES: 0
+     CREATED_TMP_TABLES: 0
+       SELECT_FULL_JOIN: 0
+ SELECT_FULL_RANGE_JOIN: 0
+           SELECT_RANGE: 0
+     SELECT_RANGE_CHECK: 0
+            SELECT_SCAN: 0
+      SORT_MERGE_PASSES: 0
+             SORT_RANGE: 0
+              SORT_ROWS: 0
+              SORT_SCAN: 0
+          NO_INDEX_USED: 0
+     NO_GOOD_INDEX_USED: 0
+       NESTING_EVENT_ID: NULL
+     NESTING_EVENT_TYPE: NULL
+*************************** 2. row ***************************
+              THREAD_ID: 46888
+               EVENT_ID: 147
+           END_EVENT_ID: NULL
+             EVENT_NAME: statement/sql/select
+                 SOURCE: mysqld.cc:966
+            TIMER_START: 599232088336688000
+              TIMER_END: 599232453878044000
+             TIMER_WAIT: 365541356000
+              LOCK_TIME: 169088000000
+               SQL_TEXT: select * from performance_schema.events_statements_current where SQL_TEXT like '%lm_repayment_plan%'
+                 DIGEST: NULL
+            DIGEST_TEXT: NULL
+         CURRENT_SCHEMA: performance_schema
+            OBJECT_TYPE: NULL
+          OBJECT_SCHEMA: NULL
+            OBJECT_NAME: NULL
+  OBJECT_INSTANCE_BEGIN: NULL
+            MYSQL_ERRNO: 0
+      RETURNED_SQLSTATE: NULL
+           MESSAGE_TEXT: NULL
+                 ERRORS: 0
+               WARNINGS: 0
+          ROWS_AFFECTED: 0
+              ROWS_SENT: 1
+          ROWS_EXAMINED: 0
+CREATED_TMP_DISK_TABLES: 0
+     CREATED_TMP_TABLES: 0
+       SELECT_FULL_JOIN: 0
+ SELECT_FULL_RANGE_JOIN: 0
+           SELECT_RANGE: 0
+     SELECT_RANGE_CHECK: 0
+            SELECT_SCAN: 1
+      SORT_MERGE_PASSES: 0
+             SORT_RANGE: 0
+              SORT_ROWS: 0
+              SORT_SCAN: 0
+          NO_INDEX_USED: 1
+     NO_GOOD_INDEX_USED: 0
+       NESTING_EVENT_ID: NULL
+     NESTING_EVENT_TYPE: NULL
+2 rows in set (0.37 sec)
+
+ERROR: 
+No query specified
+
+mysql> # 查看未提交的事务运行时间，线程id，用户等信息
+
+mysql> select timediff(sysdate(),trx_started) timediff,sysdate(),trx_started,id,USER,DB,COMMAND,STATE,trx_state from information_schema.processlist,information_schema.innodb_trx where trx_mysql_thread_id=id;
++----------+---------------------+---------------------+-------+-------------+---------+---------+----------------+-----------+
+| timediff | sysdate()           | trx_started         | id    | USER        | DB      | COMMAND | STATE          | trx_state |
++----------+---------------------+---------------------+-------+-------------+---------+---------+----------------+-----------+
+| 00:11:59 | 2017-08-18 15:32:55 | 2017-08-18 15:20:56 | 47613 | system user | fireway | Connect | altering table | RUNNING   |
++----------+---------------------+---------------------+-------+-------------+---------+---------+----------------+-----------+
+1 row in set (0.00 sec)
+
+
+mysql> show table status where name='lm_repayment_plan'\G;
+*************************** 1. row ***************************
+           Name: lm_repayment_plan
+         Engine: InnoDB
+        Version: 10
+     Row_format: Compact
+           Rows: 9871710
+ Avg_row_length: 1294
+    Data_length: 12783190016
+Max_data_length: 0
+   Index_length: 3085959168
+      Data_free: 4194304
+ Auto_increment: 10884325
+    Create_time: 2017-08-18 11:34:03
+    Update_time: NULL
+     Check_time: NULL
+      Collation: utf8_general_ci
+       Checksum: NULL
+ Create_options: 
+        Comment: 
+1 row in set (0.01 sec)
+
+ERROR: 
+No query specified
+
+
+# 大概5点中结束了alter
+
+mysql> select @@old_alter_table;
++-------------------+
+| @@old_alter_table |
++-------------------+
+|                 0 |
++-------------------+
+1 row in set (0.00 sec)
+
+
+
+mysql> show slave status\G;
+*************************** 1. row ***************************
+               Slave_IO_State: Waiting for master to send event
+                  Master_Host: 119.90.40.222
+                  Master_User: repluser
+                  Master_Port: 3306
+                Connect_Retry: 60
+              Master_Log_File: master-bin.006436
+          Read_Master_Log_Pos: 178779087
+               Relay_Log_File: hjkj-mysql-relay-bin.012103
+                Relay_Log_Pos: 72312798
+        Relay_Master_Log_File: master-bin.006399
+             Slave_IO_Running: Yes
+            Slave_SQL_Running: Yes
+              Replicate_Do_DB: 
+          Replicate_Ignore_DB: 
+           Replicate_Do_Table: 
+       Replicate_Ignore_Table: 
+      Replicate_Wild_Do_Table: fireway.%,finance.%
+  Replicate_Wild_Ignore_Table: 
+                   Last_Errno: 0
+                   Last_Error: 
+                 Skip_Counter: 0
+          Exec_Master_Log_Pos: 206533593
+              Relay_Log_Space: 41029278606
+              Until_Condition: None
+               Until_Log_File: 
+                Until_Log_Pos: 0
+           Master_SSL_Allowed: No
+           Master_SSL_CA_File: 
+           Master_SSL_CA_Path: 
+              Master_SSL_Cert: 
+            Master_SSL_Cipher: 
+               Master_SSL_Key: 
+        Seconds_Behind_Master: 99817
+Master_SSL_Verify_Server_Cert: No
+                Last_IO_Errno: 0
+                Last_IO_Error: 
+               Last_SQL_Errno: 0
+               Last_SQL_Error: 
+  Replicate_Ignore_Server_Ids: 
+             Master_Server_Id: 100
+                  Master_UUID: 5cc28f3c-6a8d-11e4-beff-00163e5563d9
+             Master_Info_File: mysql.slave_master_info
+                    SQL_Delay: 0
+          SQL_Remaining_Delay: NULL
+      Slave_SQL_Running_State: System lock
+           Master_Retry_Count: 86400
+                  Master_Bind: 
+      Last_IO_Error_Timestamp: 
+     Last_SQL_Error_Timestamp: 
+               Master_SSL_Crl: 
+           Master_SSL_Crlpath: 
+           Retrieved_Gtid_Set: 5cc28f3c-6a8d-11e4-beff-00163e5563d9:491028361-559491771
+            Executed_Gtid_Set: 5cc28f3c-6a8d-11e4-beff-00163e5563d9:1-557020574:557020902:557020904,
+d58717f7-6c22-11e7-9954-00163e00013d:1-1251079
+                Auto_Position: 1
+1 row in set (0.01 sec)
+
+ERROR: 
+No query specified
+
+mysql> select sysdate();
++---------------------+
+| sysdate()           |
++---------------------+
+| 2017-08-18 17:20:38 |
++---------------------+
+1 row in set (0.00 sec)
+```
+
+## 总结建议
+
+1. 今天的问题的核心是：报表应用在数据库中执行了 一条未提交或未回滚的 错误语句（非语法错误）从而产生了元数据锁导致的。该故障问题很冷僻。
+2. alter table的语句是很危险的，在操作之前最好确认对要操作的表没有任何进行中的操作、没有未提交事务、也没有显式事务中的报错语句。
+3. 建议执行DDL的工程师去详细了解一下mysql官方使用手册中关于online ddl的算法，影响到alter执行的时间和业务的使用;
+4. 当数据库系统架构越来越复杂后，DDL操作是必须流程化的，随意操作容易带来未知的风险，建议贵司内部想一个比较好的流程来规避风险
+
+## 客户反馈
+
+1. 我们是每周三晚上上线偶尔对数据库结构有操作，之前沟通过他们是通过脚本执行的alter操作。
+2. 之后上线新的服务对数据库ddl有操作的话，那么上线后关闭报表的查询请求来避免今天这种情况。
