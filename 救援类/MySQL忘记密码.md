@@ -1,0 +1,76 @@
+# MySQL忘记密码
+
+
+
+ 故障症状：无法登陆数据库服务器
+
+ 故障原因：忘记 MySQL的 root 密码
+
+ 故障分类：权限认证
+
+ 故障解决方案：
+
+> ##### 破解 rhel7 MariaDB 5.5 的 root 密码
+
+MySQL 5.5 破解方法相同
+
+1. 停止服务 `systemctl stop mariadb`
+2. 跳过授权表启动服务 `mysqld_safe --skip-grant-tables &`
+3. 修改root密码 `update mysql.user set password=password('uplooking') where user='root';`
+4. 停止跳过授权表启动服务 `kill -9 进程号`
+5. 启动服务 `systemctl start mariadb`
+
+ 
+
+```
+# rhel7 mariadb5.5
+[root@serverg ~]# systemctl stop mariadb
+[root@serverg ~]# mysqld_safe --skip-grant-tables &
+[1] 3078
+[root@serverg ~]# 160304 18:36:15 mysqld_safe Logging to '/var/log/mariadb/mariadb.log'.
+160304 18:36:15 mysqld_safe Starting mysqld daemon with databases from /var/lib/mysql
+[root@serverg ~]# mysql -uxxx
+Welcome to the MariaDB monitor. Commands end with ; or \g.
+Your MariaDB connection id is 1
+Server version: 5.5.41-MariaDB MariaDB Server
+Copyright (c) 2000, 2014, Oracle, MariaDB Corporation Ab and others.
+Type 'help;' or '\h' for help. Type '\c' to clear the current input statement.
+MariaDB [(none)]> use mysql;
+Reading table information for completion of table and column names
+You can turn off this feature to get a quicker startup with -A
+Database changed
+MariaDB [mysql]> update user set password=password("redhat") where user="root" and
+host="localhost";
+Query OK, 1 row affected (0.00 sec)
+Rows matched: 1 Changed: 1 Warnings: 0
+MariaDB [mysql]> \q
+Bye
+[root@serverg ~]# ps -ef |grep mysql
+mysql
+3221
+1 0 18:36 ?
+00:00:00 /usr/libexec/mysqld --basedir=/usr
+--datadir=/var/lib/mysql --plugin-dir=/usr/lib64/mysql/plugin --user=mysql --skip-grant-tables --log-
+error=/var/log/mariadb/mariadb.log
+--pid-file=/var/run/mariadb/mariadb.pid
+--socket=/var/lib/mysql/mysql.sock
+root
+3287 3256 0 18:40 pts/0 00:00:00 grep --color=auto mysql
+[root@serverg ~]# kill -9 3221
+[root@serverg ~]# systemctl start mariadb
+[root@serverg ~]# mysql -uroot -predhat
+Welcome to the MariaDB monitor. Commands end with ; or \g.
+Your MariaDB connection id is 3
+Server version: 5.5.41-MariaDB MariaDB Server
+Copyright (c) 2000, 2014, Oracle, MariaDB Corporation Ab and others.
+Type 'help;' or '\h' for help. Type '\c' to clear the current input statement.
+MariaDB [(none)]>
+```
+
+> ##### 破解 CentOS 6.7 MySQL 5.7 的 root 密码
+
+1. 修改MySQL的配置文件（默认为/etc/my.cnf）,在[mysqld]下添加一行`skip-grant-tables`修改MySQL的配置文件（默认为/etc/my.cnf）,在[mysqld]下添加一行`skip-grant-tables`
+2. 重新启动服务 `srevice mysqld restart`
+3. 修改root密码 `update mysql.user set authentication_string=password('uplooking') where user='root';`
+4. 修改MySQL的配置文件（默认为/etc/my.cnf）,在[mysqld]下删除`skip-grant-tables`
+5. 重新启动服务 `srevice mysqld restart`
