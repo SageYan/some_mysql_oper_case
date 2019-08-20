@@ -1,0 +1,222 @@
+
+
+[TOC]
+
+# RDS For MySQL CPU 飙高
+
+## 故障排查明细
+
+### 负载分析
+
+cpu飙高时间SLB活动连接数达到最高
+
+
+
+### 事务分析
+
+存在大量的查询开启事务
+
+### SQL分析
+
+慢查询语句如下：
+
+```sql
+
+select ename, eid, cd, zt, cdbzt
+ , kg, zc
+from tl_t_staff_attendance_statistic
+ left join (select eid as 'z', count(attendance_result) as 'cd'
+  from tl_t_staff_attendance_statistic
+  where attendance_result = 0
+   and unix_timestamp(sign_date) >= '1533052800'
+   and unix_timestamp(sign_date) <= '1535731199'
+  group by eid
+  ) a on z = eid
+ left join (select eid as 'm', count(attendance_result) as 'zt'
+  from tl_t_staff_attendance_statistic
+  where attendance_result = 1
+   and unix_timestamp(sign_date) >= '1533052800'
+   and unix_timestamp(sign_date) <= '1535731199'
+  group by eid
+  ) b on m = eid
+ left join (select eid as 'i', count(attendance_result) as 'cdbzt'
+  from tl_t_staff_attendance_statistic
+  where attendance_result = 2
+   and unix_timestamp(sign_date) >= '1533052800'
+   and unix_timestamp(sign_date) <= '1535731199'
+  group by eid
+  ) c on i = eid
+ left join (select eid as 'k', count(attendance_result) as 'kg'
+  from tl_t_staff_attendance_statistic
+  where attendance_result = 3
+   and unix_timestamp(sign_date) >= '1533052800'
+   and unix_timestamp(sign_date) <= '1535731199'
+  group by eid
+  ) d on k = eid
+ left join (select eid as 'l', count(attendance_result) as 'zc'
+  from tl_t_staff_attendance_statistic
+  where attendance_result = 4
+   and unix_timestamp(sign_date) >= '1533052800'
+   and unix_timestamp(sign_date) <= '1535731199'
+  group by eid
+  ) e on l = eid
+ left join (select u.real_name as ename, u.id as 'qq'
+  from s_user u
+  ) ii on qq = eid
+where 1 = 1
+ and eid in (select user_id
+  from s_user_extend
+  where depart_code like (
+   select depart_code
+   from s_user_extend
+   where user_id = '22150'
+    and (is_district_manager = 1
+     or is_department_manager = 1
+     or is_group_manager = 1)
+   ))
+group by eid
+```
+
+该慢SQL执行时间占用CPU的70%以上
+
+## 事务优化
+
+应用代码中对SQL的查询建议不要使用事务，需要贵司开发人员调整查询代码
+
+## 慢SQL优化
+
+慢SQL优化建议，将所有的`unix_timestamp(列名) >= 数值`改为`列名 >= from_unixtime(数值)
+
+### 只有优化函数
+
+```sql
+select ename, eid, cd, zt, cdbzt
+ , kg, zc
+from tl_t_staff_attendance_statistic
+ left join (select eid as 'z', count(attendance_result) as 'cd'
+  from tl_t_staff_attendance_statistic
+  where attendance_result = 0
+   and sign_date >= from_unixtime(1533052800)
+   and sign_date <= from_unixtime(1535731199)
+  group by eid
+  ) a on z = eid
+ left join (select eid as 'm', count(attendance_result) as 'zt'
+  from tl_t_staff_attendance_statistic
+  where attendance_result = 1
+   and sign_date >= from_unixtime(1533052800)
+   and sign_date <= from_unixtime(1535731199)
+  group by eid
+  ) b on m = eid
+ left join (select eid as 'i', count(attendance_result) as 'cdbzt'
+  from tl_t_staff_attendance_statistic
+  where attendance_result = 2
+   and sign_date >= from_unixtime(1533052800)
+   and sign_date <= from_unixtime(1535731199)
+  group by eid
+  ) c on i = eid
+ left join (select eid as 'k', count(attendance_result) as 'kg'
+  from tl_t_staff_attendance_statistic
+  where attendance_result = 3
+   and sign_date >= from_unixtime(1533052800)
+   and sign_date <= from_unixtime(1535731199)
+  group by eid
+  ) d on k = eid
+ left join (select eid as 'l', count(attendance_result) as 'zc'
+  from tl_t_staff_attendance_statistic
+  where attendance_result = 4
+   and sign_date >= from_unixtime(1533052800)
+   and sign_date <= from_unixtime(1535731199)
+  group by eid
+  ) e on l = eid
+ left join (select u.real_name as ename, u.id as 'qq'
+  from s_user u
+  ) ii on qq = eid
+where 1 = 1
+ and eid in (select user_id
+  from s_user_extend
+  where depart_code like (
+   select depart_code
+   from s_user_extend
+   where user_id = '22150'
+    and (is_district_manager = 1
+     or is_department_manager = 1
+     or is_group_manager = 1)
+   ))
+group by eid
+```
+
+
+
+### 优化函数加上SQL结构改写
+
+```sql
+SELECT
+   distinct ii.ename, t1.eid, t2.cd, t2.zt, t2.cdbzt, t2.kg, t2.zc
+FROM
+   tl_t_staff_attendance_statistic t1
+ join s_user_extend t3 on t1.eid = t3.user_id
+ join s_user_extend t4 on t3.depart_code LIKE t4.depart_code
+     and t4.user_id = '22150'
+                   AND (t4.is_district_manager = 1
+                       OR t4.is_department_manager = 1
+                       OR t4.is_group_manager = 1)
+LEFT JOIN
+(select eid,
+sum(case when attendance_result = 0 then 1 else 0 end) cd,
+sum(case when attendance_result = 1 then 1 else 0 end) zt,
+sum(case when attendance_result = 2 then 1 else 0 end) cdbzt,
+sum(case when attendance_result = 3 then 1 else 0 end) kg,
+sum(case when attendance_result = 4 then 1 else 0 end) zc
+from tl_t_staff_attendance_statistic
+where sign_date >= FROM_UNIXTIME(1533052800) AND sign_date <= FROM_UNIXTIME(1535731199)
+group by eid) t2 on t2.eid = t1.eid
+LEFT JOIN
+(SELECT u.real_name AS ename, u.id AS 'qq'
+ FROM s_user u
+ ) ii ON ii.qq = t1.eid
+```
+
+
+
+### 优化后的SQL执行效率对比
+
+| 测试 | 原SQL  | 只优化函数 | 优化函数和结构 |
+| :--- | :----- | :--------- | :------------- |
+| 1    | 2062ms | 1436ms     | 1182ms         |
+| 2    | 2164ms | 1444ms     | 1179ms         |
+| 3    | 2082ms | 1444ms     | 1178ms         |
+
+## 参数优化
+
+```sql
+mysql>show global status like 'open%tables%';
++-------------------------+-----------------+
+| Variable_name           | Value           |
++-------------------------+-----------------+
+| Open_tables             | 1982           |
+| Opened_tables           | 70701           |
++-------------------------+-----------------+
+mysql>show global variables like '%table_open_cache%';
++----------------------------+-----------------+
+| Variable_name             | Value           |
++----------------------------+-----------------+
+| table_open_cache           | 2000           |
+| table_open_cache_instances | 1               |
++----------------------------+-----------------+
+# Open_tables表示打开表的数量，Opened_tables表示打开过的表数量，如果Opened_tables数量过大，说明配置中table_open_cache值可能太小，我们查询一下服务器table_open_ache值：
+比较合适的值为：
+ 
+Open_tables / Opened_tables * 100% >= 85%
+Open_tables / table_open_cache * 100% <= 95%
+# 将table_open_cache从2000调整为80000
+```
+
+## 总结
+
+- 事务优化：应用代码中对SQL的查询建议不要使用事务，需要贵司开发人员调整查询代码
+- SQL优化：针对慢SQL给出两个优化SQL，测试验证通过即可上生产
+- 参数优化：调整表高速缓存的大小`table_open_cache`从2000调整至80000
+
+1. 从慢查询监控中可以看到贵司的查询执行效率低，（具体慢查询语句见报告），为了获得预期的结果集需要访问大量的数据（平均逻辑IO高），
+2. 从近一个月的应用负载监控可以清晰的看到今日CPU飙高时间段的应用负载（QPS）达到最高峰。
+   因此贵司这种情况是属于QPS 高和查询效率低的混合模式导致的 CPU 使用率高问题，解决需要从优化查询入手。具体的SQL优化语句已写在报告中（给出两种优化SQL，SQL查询效率提高一倍）
